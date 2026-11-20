@@ -1,0 +1,274 @@
+# Build the Ximera site with tex4npm, publish it to GitHub Pages, and also to
+# S3 if a bucket is set.
+#
+# GitHub Pages needs no secrets. It must be switched on once under
+# Settings > Pages, with "GitHub Actions" as the source.
+#
+# Every push and pull request builds the site. Deploying is optional: it only
+# happens on pushes to the default branch, and only when the S3_BUCKET variable
+# exists. Set these under Settings > Secrets and variables > Actions:
+#
+#   Secrets:   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   Variables: S3_BUCKET     the bucket name
+#              AWS_REGION    the bucket's region, e.g. us-east-2
+#              S3_PREFIX     optional folder inside the bucket, e.g. sandbox
+
+name: Build and deploy
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Full TeX Live, Debian based. Includes pdflatex, latex, tex4ht, t4ht,
+    # dvisvgm and the CTAN packages activities are likely to load.
+    container:
+      image: texlive/texlive:latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # For the record: which TeX Live this build ran with.
+      - name: Show TeX Live version
+        run: |
+          pdflatex --version | head -1
+          lualatex --version | head -1
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # Workaround for @ximera/answer 2.0.0. Its post-processing step turns
+      # \answer{...} inside display math into an input box, but only looks for
+      # <div class="mathjax-block">. Current TeX4ht writes display math as
+      # <span class="mathjax-block">, so those answers were left as a literal
+      # \answer, which MathJax shows in red. The same goes for equation, align
+      # and the other display environments, which TeX4ht writes with the
+      # class "mathjax-env". Remove this step once the package
+      # handles both. The grep makes the build fail loudly if the package
+      # changes and the patch no longer applies.
+      - name: Patch answer post-processing for span display math
+        run: |
+          f=node_modules/@ximera/answer/postprocess.js
+          sed -i "s/'span.mathjax-inline, div.mathjax-block'/'span.mathjax-inline, div.mathjax-block, span.mathjax-block, span.mathjax-env, div.mathjax-env'/" "$f"
+          grep -q "span.mathjax-block, span.mathjax-env, div.mathjax-env" "$f"
+
+      # Workaround for tex4npm 2.0.0. For the copy of each activity inside a
+      # course folder, it copies the page's images next to the copy, and then
+      # also adds "../" to every <img src>, so the link points one folder too
+      # high and photos show as broken. Remove the "../" rewrite for images.
+      # Remove this step once tex4npm is fixed.
+      - name: Patch image links in course copies
+        run: |
+          f=node_modules/tex4npm/src/xourse.js
+          sed -i "/\$('img\[src\]').each((_, el) => rewrite(el, 'src'));/d" "$f"
+          if grep -q "img\[src\]').each((_, el) => rewrite" "$f"; then echo "image-link patch did not apply"; exit 1; fi
+
+      # MathML intent for screen readers. src/intent.cfg holds a MathJax
+      # configuration that defines the commands of latex/xmintent.sty
+      # (\xmunits, \xmabs, \xmpoint, ...) and the two building blocks
+      # \MathMLintent and \MathMLarg, and switches on MathJax's assistive
+      # MathML. ximera.cfg comes from the @ximera/core package, so
+      # the lines are inserted into the installed copy, just before
+      # \begin{document}.
+      - name: Add MathML intent configuration
+        run: |
+          f=node_modules/@ximera/core/latex/dist/ximera.cfg
+          if [ -f src/intent.cfg ]; then
+            awk 'FNR==NR{a[n++]=$0; next} /^\\begin\{document\}/{for(i=0;i<n;i++) print a[i]} {print}' src/intent.cfg "$f" > "$f.new"
+            mv "$f.new" "$f"
+            grep -q "xmintent" "$f"
+          fi
+
+      # The web build cannot read the size of a PNG or JPG by itself. Without
+      # a .xbb file next to the picture it assumes the picture is square, which
+      # distorts it. Create the missing .xbb files; ones committed to the
+      # repository are left alone.
+      - name: Create size files for pictures
+        run: |
+          find src -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) | while read -r f; do
+            [ -f "${f%.*}.xbb" ] || (cd "$(dirname "$f")" && extractbb "$(basename "$f")")
+          done
+          echo "size files present: $(find src -name '*.xbb' | wc -l)"
+
+      # latex/ holds style files written for this site (xmintent.sty). The
+      # build puts its own folder first on TeX's search path and keeps what
+      # is already in TEXINPUTS; the colon at the end keeps the standard
+      # TeX Live folders.
+      - name: Build site
+        run: TEXINPUTS="$PWD/latex//:" npm run build
+
+      # Every page carries an inline rule, ".image-environment img { width:
+      # unset; }", which makes the browser ignore the size given in LaTeX
+      # (\includegraphics[width=...]) and show pictures at full size. Remove
+      # it so the LaTeX size applies; src/custom.css keeps pictures from being
+      # wider than the text.
+      - name: Let picture sizes from LaTeX apply
+        run: |
+          find dist -name '*.html' -exec sed -i 's/\.image-environment img { width: unset; }//' {} +
+          echo "pages still carrying the rule: $(grep -rl --include='*.html' 'image-environment img { width: unset; }' dist | wc -l)"
+
+      # Site-specific CSS. Appending it to the bundled stylesheet puts these
+      # rules last, so they override the Ximera defaults.
+      - name: Add custom CSS
+        run: |
+          if [ -f src/custom.css ]; then
+            printf '\n/* ---- src/custom.css ---- */\n' >> dist/ximera.css
+            cat src/custom.css >> dist/ximera.css
+          fi
+
+      # Hand-written pages. Everything under static/ is copied into the site
+      # as it is, so static/answer-box/after.html is published as
+      # answer-box/after.html. A folder here must not share its name with a
+      # folder under src/.
+      - name: Add static pages
+        run: |
+          if [ -d static ]; then
+            cp -R static/. dist/
+            echo "static files added: $(find static -type f | wc -l)"
+          fi
+
+      # A tagged, accessible PDF of every activity, made from the same .tex
+      # file as its web page. LuaLaTeX compiles the activity with tagging
+      # switched on and TailorSwiftBot_Nov_2026.sty loaded before the class;
+      # nothing in the activity itself changes. The PDF is published next to
+      # the page, as <activity>/main.pdf, and the page gets a link to it.
+      # This works on a copy of src/, so the web build's files are not
+      # touched. An activity that does not compile is reported and skipped;
+      # it never stops the website.
+      - name: Build tagged PDFs
+        run: |
+          work=$(mktemp -d)
+          cp -R src "$work/src"
+          export TEXINPUTS="$PWD/src/.tex4npm/texmf//:$PWD/latex//:$PWD/TailorSwiftBot_Nov_2026//:"
+          meta='\DocumentMetadata{lang=en,pdfversion=2.0,pdfstandard=UA-2,testphase=latest,tagging-setup={math/setup=mathml-SE}}'
+          # \answer, multipleChoice, hint and the like live in packages of
+          # their own (ximera-answer.sty, ...) which the class does not load.
+          # Load every one the build has installed, right after the class.
+          # Some of them name their own commands in their version line
+          # (ximera-choice.sty: "\choice / \otherchoice ...", ximera-xkcd.sty:
+          # "\xkcd command") before defining them, which LaTeX reports as
+          # errors. Make every command named there harmless until its
+          # package defines it.
+          lets=""; uses=""
+          for sty in src/.tex4npm/texmf/tex/latex/ximera-*.sty; do
+            [ -f "$sty" ] || continue
+            for cs in $(grep -m1 'ProvidesPackage' "$sty" | sed 's/^[^[]*//' | grep -o '\\[A-Za-z]*' || true); do
+              lets="$lets\\let$cs\\relax"
+            done
+            uses="$uses\\usepackage{$(basename "$sty" .sty)}"
+          done
+          extras="$lets$uses"
+          echo "component packages: $extras"
+          made=0
+          for f in "$work"/src/*/main.tex; do
+            dir=$(dirname "$f"); name=$(basename "$dir")
+            ( cd "$dir"
+              for pass in 1 2; do
+                lualatex -interaction=nonstopmode -shell-escape -jobname=main-tagged "$meta\\RequirePackage{TailorSwiftBot_Nov_2026}\\AddToHook{class/ximera/after}{$extras}\\input{main.tex}" > main-tagged.txt 2>&1 || true
+              done )
+            errors=$(grep -c '^!' "$dir/main-tagged.txt" || true)
+            if [ "$errors" = 0 ] && [ -s "$dir/main-tagged.pdf" ]; then
+              cp "$dir/main-tagged.pdf" "dist/$name/main.pdf"
+              made=$((made+1))
+              echo "tagged PDF made: $name"
+              grep -E 'Warning' "$dir/main-tagged.txt" | sort | uniq -c | sort -rn | head -5 | cut -c1-150
+            else
+              echo "::warning::No tagged PDF for $name: $errors LaTeX error(s)"
+              grep -A4 '^!' "$dir/main-tagged.txt" | grep -v '^--$' | head -28 | cut -c1-150
+            fi
+          done
+          echo "tagged PDFs made: $made"
+          # A link from each page to its PDF: the page itself, and its copy
+          # inside the course folder.
+          for pdf in dist/*/main.pdf; do
+            [ -f "$pdf" ] || continue
+            name=$(basename "$(dirname "$pdf")")
+            for page in "dist/$name/main.html" dist/*/"$name"/main.html; do
+              [ -f "$page" ] || continue
+              case "$page" in
+                "dist/$name/main.html") href="main.pdf" ;;
+                *) href="../../$name/main.pdf" ;;
+              esac
+              sed -i "s|\\(<main class=\"ximera-content\"[^>]*>\\)|\\1<p class=\"tagged-pdf-link\"><a href=\"$href\">This page as a tagged PDF</a></p>|" "$page"
+            done
+          done
+
+      # The build has no start page. Send visitors of the site's address to
+      # the course page.
+      - name: Add start page
+        run: |
+          if [ ! -f dist/index.html ]; then
+            printf '%s\n' '<!DOCTYPE html>' '<html lang="en"><head><meta charset="utf-8">' '<title>Ximera Sandbox</title>' '<meta http-equiv="refresh" content="0; url=sandbox.html">' '</head><body><p><a href="sandbox.html">Ximera Sandbox</a></p></body></html>' > dist/index.html
+          fi
+
+      - name: Sanity check
+        run: |
+          test -s dist/ximera.js
+          test -s dist/ximera.css
+          echo "HTML pages built: $(find dist -name '*.html' | wc -l)"
+
+      # Report only, never fails the build: a literal \answer can be legitimate,
+      # for example inside a verbatim listing.
+      - name: Report answer boxes left unconverted
+        run: |
+          grep -rl --include='*.html' '\\answer' dist > /tmp/unconverted.txt || true
+          echo "HTML pages still containing a literal \\answer: $(wc -l < /tmp/unconverted.txt)"
+          head -20 /tmp/unconverted.txt
+
+      - name: Upload site for GitHub Pages
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Configure AWS credentials
+        if: vars.S3_BUCKET != '' && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # --delete removes objects that are no longer part of the site. With a
+      # prefix it only looks inside that folder; without one it covers the
+      # whole bucket, so never point a prefix-less deploy at a shared bucket.
+      - name: Deploy to S3
+        if: vars.S3_BUCKET != '' && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          S3_PREFIX: ${{ vars.S3_PREFIX }}
+        run: |
+          if [ -n "$S3_PREFIX" ]; then
+            npx tex4npm deploy "$S3_BUCKET" --prefix "$S3_PREFIX" --delete
+          else
+            npx tex4npm deploy "$S3_BUCKET" --delete
+          fi
+
+  pages:
+    name: Publish to GitHub Pages
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

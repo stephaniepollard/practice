@@ -1,0 +1,58 @@
+\documentclass{ximera}
+\input{../preamble.tex}
+
+\title{Lines in the Plane}
+
+\begin{document}
+\begin{abstract}
+Integrals and Riemann Sums
+\end{abstract}
+\maketitle
+
+I like Taylor Swift.
+
+
+\begin{figure}
+\begin{image}
+
+    \includegraphics[width=5.2in]{TS-Sabrina-Calc.png}
+    \caption{A cringe meme about calculus.}
+    \xmalt{Taylor Swift and Sabrina Carpenter photographed on a sidewalk. Taylor is labeled with $F(x)=\int f(x)dx$ and Sabrina is labeled with $f(x)$. Taylor looks much taller than Sabrina.}
+\end{image}
+\end{figure}
+
+The \dfn{slope} of the line through two points is the change in $y$ divided
+by the change in $x$.
+
+\begin{problem}
+The line below passes through the points $(1,1)$ and $(3,5)$.
+
+\begin{center}
+\begin{tikzpicture}[scale=.75]
+  \draw[<->] (-1,0)--(5,0) node[right]{$x$};
+  \draw[<->] (0,-1)--(0,6) node[above]{$y$};
+  \draw[thick] (0.25,-0.5)--(3.5,6);
+  \fill (1,1) circle (2pt) node[right]{$(1,1)$};
+  \fill (3,5) circle (2pt) node[right]{$(3,5)$};
+\end{tikzpicture}
+\end{center}
+
+Its slope is
+\[
+m=\answer{2}.
+\]
+
+Its equation in slope-intercept form is
+\[
+y=\answer{2}x+\answer{-1}.
+\]
+\end{problem}
+
+\begin{problem}
+A line perpendicular to the one above has slope
+\[
+m_{\perp}=\answer{-\frac{1}{2}}.
+\]
+\end{problem}
+
+\end{document}
